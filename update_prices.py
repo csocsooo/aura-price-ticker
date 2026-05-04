@@ -1,24 +1,22 @@
 """
-AURA DEX Telegram pinned price ticker (v3)
-------------------------------------------
-Fetches market data and edits a pinned Telegram channel message.
-
-v3 features:
-    - 8 coins: BTC ETH SOL TRX XAUT JUP RAY ORCA
-    - 24h and 7d percent change with green/red emoji
-    - 7-day sparkline mini-chart per coin (Unicode block chars)
-    - Global market line: total market cap, BTC dominance, Fear & Greed
-    - Top mover / worst performer (24h) callouts
-    - Auto pin + edit; safe re-runs
+AURA DEX Telegram pinned price ticker (v4 — multi-channel, EN + RO)
+-------------------------------------------------------------------
+Fetches market data and edits a pinned Telegram message in one or
+more channels in different languages, in a single run.
 
 Required env vars:
-    BOT_TOKEN   Telegram bot token from @BotFather
-    CHAT_ID     Channel ID or @username (e.g. @auradexecosystem)
+    BOT_TOKEN     Telegram bot token from @BotFather (one bot, both channels)
 
-Optional env vars:
-    MESSAGE_ID    ID of the message to edit. If missing or 0, the
-                  script SENDS + PINS a new message and prints its ID.
-    AURA_DEX_URL  Link in the footer. Default: https://auradex.io
+Channel 1 (English) — required:
+    CHAT_ID       e.g. @auradexecosystem
+    MESSAGE_ID    Set after the first init run.
+
+Channel 2 (Romanian) — optional:
+    CHAT_ID_RO    e.g. -1003185057272 (numeric for private channels)
+    MESSAGE_ID_RO Set after the first init run for the RO channel.
+
+Optional:
+    AURA_DEX_URL  Footer link. Default: https://auradex.io
 """
 
 import os
@@ -29,7 +27,6 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-# (CoinGecko-id, display-symbol)
 COINS = [
     ("bitcoin",                  "BTC"),
     ("ethereum",                 "ETH"),
@@ -54,13 +51,59 @@ FNG_URL = "https://api.alternative.me/fng/"
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
-SPARK_WIDTH = 10  # chars per coin row
+SPARK_WIDTH = 10
+
+# ---------- i18n ----------
+
+LABELS = {
+    "en": {
+        "title": "Live Crypto Prices",
+        "market": "Market",
+        "btc_d": "BTC.D",
+        "sentiment": "Sentiment",
+        "best_24h": "Best 24h",
+        "worst_24h": "Worst 24h",
+        "format_note": "Format: 24h % / 7d % · 🟢 up · 🔴 down · ▁▂▃▄▅▆▇█ = 7d trend",
+        "updated": "Updated",
+        "auto_refresh": "auto-refresh 15 min",
+        "trade_on": "Trade on",
+    },
+    "ro": {
+        "title": "Prețuri Crypto Live",
+        "market": "Piață",
+        "btc_d": "BTC.D",
+        "sentiment": "Sentiment",
+        "best_24h": "Top 24h",
+        "worst_24h": "Flop 24h",
+        "format_note": "Format: 24h % / 7d % · 🟢 creștere · 🔴 scădere · ▁▂▃▄▅▆▇█ = trend 7 zile",
+        "updated": "Actualizat",
+        "auto_refresh": "actualizare automată 15 min",
+        "trade_on": "Tranzacționează pe",
+    },
+}
+
+FNG_TRANS = {
+    "en": {
+        "extreme fear":  "Extreme Fear",
+        "fear":          "Fear",
+        "neutral":       "Neutral",
+        "greed":         "Greed",
+        "extreme greed": "Extreme Greed",
+    },
+    "ro": {
+        "extreme fear":  "Frică Extremă",
+        "fear":          "Frică",
+        "neutral":       "Neutru",
+        "greed":         "Lăcomie",
+        "extreme greed": "Lăcomie Extremă",
+    },
+}
 
 
 # ---------- HTTP ----------
 
 def http_get_json(url: str, timeout: int = 15):
-    req = urllib.request.Request(url, headers={"User-Agent": "aura-price-bot/3.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "aura-price-bot/4.0"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -106,7 +149,6 @@ def fetch_market_data() -> list:
 
 
 def fetch_global() -> dict:
-    """Returns {'mcap_usd', 'mcap_change_24h_pct', 'btc_dominance'} or None on failure."""
     try:
         d = fetch_with_retry(CG_GLOBAL_URL)["data"]
         return {
@@ -120,7 +162,6 @@ def fetch_global() -> dict:
 
 
 def fetch_fng() -> dict:
-    """Returns {'value', 'classification'} or None on failure."""
     try:
         d = fetch_with_retry(FNG_URL)
         item = d["data"][0]
@@ -198,6 +239,11 @@ def fng_emoji(classification: str) -> str:
     return "⚪"
 
 
+def translate_fng(classification: str, lang: str) -> str:
+    key = (classification or "").strip().lower()
+    return FNG_TRANS.get(lang, FNG_TRANS["en"]).get(key, classification or "")
+
+
 def make_sparkline(prices, width: int = SPARK_WIDTH) -> str:
     if not prices or len(prices) < 2:
         return " " * width
@@ -218,25 +264,25 @@ def make_sparkline(prices, width: int = SPARK_WIDTH) -> str:
 
 # ---------- Message builder ----------
 
-def build_message(market_data: list, global_data, fng_data, aura_url: str) -> str:
+def build_message(market_data, global_data, fng_data, aura_url: str, lang: str = "en") -> str:
+    L = LABELS.get(lang, LABELS["en"])
     ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
-    # Top header line: market cap + BTC.D + sentiment
     header_bits = []
     if global_data:
         header_bits.append(
-            f"Market {fmt_mcap(global_data['mcap_usd'])} "
+            f"{L['market']} {fmt_mcap(global_data['mcap_usd'])} "
             f"({global_data['mcap_change_24h_pct']:+.2f}%)"
         )
-        header_bits.append(f"BTC.D {global_data['btc_dominance']:.1f}%")
+        header_bits.append(f"{L['btc_d']} {global_data['btc_dominance']:.1f}%")
     if fng_data:
+        cls_translated = translate_fng(fng_data["classification"], lang)
         header_bits.append(
-            f"Sentiment {fng_data['value']} "
-            f"{fng_data['classification']} {fng_emoji(fng_data['classification'])}"
+            f"{L['sentiment']} {fng_data['value']} "
+            f"{cls_translated} {fng_emoji(fng_data['classification'])}"
         )
     header_line = " · ".join(header_bits)
 
-    # Coin table rows with sparklines
     rows = []
     for sym, c in market_data:
         emoji = direction_emoji(c.get("price_change_percentage_24h"))
@@ -244,11 +290,9 @@ def build_message(market_data: list, global_data, fng_data, aura_url: str) -> st
         pct24 = fmt_pct(c.get("price_change_percentage_24h"))
         pct7d = fmt_pct(c.get("price_change_percentage_7d_in_currency"))
         sp = make_sparkline(c.get("sparkline_in_7d", {}).get("price", []))
-        # symbol pad 5, price pad 11, sparkline 10
         rows.append(f"{emoji} {sym:<5} {price:<11} {sp}  {pct24:>8} / {pct7d:>8}")
     table = "\n".join(rows)
 
-    # Top mover / worst performer (24h)
     movers = [
         (sym, c.get("price_change_percentage_24h") or 0.0)
         for sym, c in market_data
@@ -258,11 +302,11 @@ def build_message(market_data: list, global_data, fng_data, aura_url: str) -> st
     best_sym, best_pct = movers_sorted[-1]
 
     movers_lines = (
-        f"🚀 Best 24h: <b>{best_sym}</b> {best_pct:+.2f}%\n"
-        f"💀 Worst 24h: <b>{worst_sym}</b> {worst_pct:+.2f}%"
+        f"🚀 {L['best_24h']}: <b>{best_sym}</b> {best_pct:+.2f}%\n"
+        f"💀 {L['worst_24h']}: <b>{worst_sym}</b> {worst_pct:+.2f}%"
     )
 
-    parts = ["<b>Live Crypto Prices</b>", ""]
+    parts = [f"<b>{L['title']}</b>", ""]
     if header_line:
         parts.append(f"<i>{header_line}</i>")
         parts.append("")
@@ -270,18 +314,18 @@ def build_message(market_data: list, global_data, fng_data, aura_url: str) -> st
     parts.append("")
     parts.append(movers_lines)
     parts.append("")
-    parts.append("<i>Format: 24h % / 7d % · 🟢 up · 🔴 down · ▁▂▃▄▅▆▇█ = 7d trend</i>")
-    parts.append(f"<i>Updated: {ts} · auto-refresh 15 min</i>")
+    parts.append(f"<i>{L['format_note']}</i>")
+    parts.append(f"<i>{L['updated']}: {ts} · {L['auto_refresh']}</i>")
     parts.append("")
-    parts.append(f'Trade on <a href="{aura_url}">AURA DEX</a>')
+    parts.append(f'{L["trade_on"]} <a href="{aura_url}">AURA DEX</a>')
 
     return "\n".join(parts)
 
 
 # ---------- Telegram I/O ----------
 
-def send_and_pin(token: str, chat_id: str, text: str) -> int:
-    print("MESSAGE_ID not set -> sending a new message and pinning it.")
+def send_and_pin(token: str, chat_id: str, text: str, label: str = "") -> int:
+    print(f"[{label}] No MESSAGE_ID -> sending + pinning new message in {chat_id}")
     res = telegram_call(token, "sendMessage", {
         "chat_id": chat_id,
         "text": text,
@@ -291,7 +335,7 @@ def send_and_pin(token: str, chat_id: str, text: str) -> int:
     if not res.get("ok"):
         raise RuntimeError(f"sendMessage failed: {res}")
     msg_id = res["result"]["message_id"]
-    print(f"Sent message_id = {msg_id}")
+    print(f"[{label}] Sent message_id = {msg_id}")
 
     pin = telegram_call(token, "pinChatMessage", {
         "chat_id": chat_id,
@@ -299,18 +343,17 @@ def send_and_pin(token: str, chat_id: str, text: str) -> int:
         "disable_notification": "true",
     })
     if not pin.get("ok"):
-        print(f"WARNING: pinChatMessage failed: {pin}")
+        print(f"[{label}] WARNING: pinChatMessage failed: {pin}")
     else:
-        print("Pinned successfully.")
+        print(f"[{label}] Pinned successfully.")
 
     print("\n=========================================")
-    print(f"  COPY THIS -> MESSAGE_ID = {msg_id}")
-    print("  Set it as a GitHub Actions secret named MESSAGE_ID.")
+    print(f"  COPY THIS -> {label}MESSAGE_ID = {msg_id}")
     print("=========================================\n")
     return msg_id
 
 
-def edit_message(token: str, chat_id: str, message_id: int, text: str) -> None:
+def edit_message(token: str, chat_id: str, message_id: int, text: str, label: str = "") -> None:
     res = telegram_call(token, "editMessageText", {
         "chat_id": chat_id,
         "message_id": message_id,
@@ -321,45 +364,70 @@ def edit_message(token: str, chat_id: str, message_id: int, text: str) -> None:
     if not res.get("ok"):
         desc = str(res.get("description", "")).lower()
         if "message is not modified" in desc:
-            print("No change in content. Skipping.")
+            print(f"[{label}] No change. Skipping.")
             return
         raise RuntimeError(f"editMessageText failed: {res}")
-    print(f"Edited message {message_id}.")
+    print(f"[{label}] Edited message {message_id} in {chat_id}.")
 
 
 # ---------- main ----------
 
+def parse_int(s: str) -> int:
+    try:
+        return int(s) if s else 0
+    except ValueError:
+        return 0
+
+
 def main() -> int:
     token = os.environ.get("BOT_TOKEN", "").strip()
-    chat_id = os.environ.get("CHAT_ID", "").strip()
-    message_id_raw = os.environ.get("MESSAGE_ID", "").strip()
     aura_url = os.environ.get("AURA_DEX_URL", "https://auradex.io").strip()
 
     if not token:
         print("ERROR: BOT_TOKEN env var missing.", file=sys.stderr)
         return 2
-    if not chat_id:
-        print("ERROR: CHAT_ID env var missing.", file=sys.stderr)
+
+    # Build list of channels from env. EN required, RO optional.
+    channels = []
+    en_chat = os.environ.get("CHAT_ID", "").strip()
+    if en_chat:
+        channels.append({
+            "label": "EN",
+            "chat_id": en_chat,
+            "message_id": parse_int(os.environ.get("MESSAGE_ID", "").strip()),
+            "lang": "en",
+        })
+    ro_chat = os.environ.get("CHAT_ID_RO", "").strip()
+    if ro_chat:
+        channels.append({
+            "label": "RO",
+            "chat_id": ro_chat,
+            "message_id": parse_int(os.environ.get("MESSAGE_ID_RO", "").strip()),
+            "lang": "ro",
+        })
+
+    if not channels:
+        print("ERROR: No channels configured. Set CHAT_ID and/or CHAT_ID_RO.", file=sys.stderr)
         return 2
 
     market_data = fetch_market_data()
     global_data = fetch_global()
     fng_data = fetch_fng()
 
-    text = build_message(market_data, global_data, fng_data, aura_url)
-    print("Built message:\n" + text + "\n")
+    failures = 0
+    for ch in channels:
+        try:
+            text = build_message(market_data, global_data, fng_data, aura_url, lang=ch["lang"])
+            print(f"\n[{ch['label']}] Built message:\n{text}\n")
+            if ch["message_id"] <= 0:
+                send_and_pin(token, ch["chat_id"], text, label=f"{ch['label']}_")
+            else:
+                edit_message(token, ch["chat_id"], ch["message_id"], text, label=ch["label"])
+        except Exception as e:
+            print(f"[{ch['label']}] ERROR: {e}", file=sys.stderr)
+            failures += 1
 
-    try:
-        message_id = int(message_id_raw) if message_id_raw else 0
-    except ValueError:
-        message_id = 0
-
-    if message_id <= 0:
-        send_and_pin(token, chat_id, text)
-        return 0
-
-    edit_message(token, chat_id, message_id, text)
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
