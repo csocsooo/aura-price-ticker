@@ -102,10 +102,21 @@ FNG_TRANS = {
 
 # ---------- HTTP ----------
 
-def http_get_json(url: str, timeout: int = 15):
-    req = urllib.request.Request(url, headers={"User-Agent": "aura-price-bot/4.0"})
+def http_get_json(url: str, timeout: int = 15, extra_headers: dict = None):
+    headers = {"User-Agent": "aura-price-bot/4.0"}
+    if extra_headers:
+        headers.update(extra_headers)
+    req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def coingecko_headers() -> dict:
+    """Returns CoinGecko Demo API key header if env var is set."""
+    key = os.environ.get("COINGECKO_API_KEY", "").strip()
+    if key:
+        return {"x-cg-demo-api-key": key}
+    return {}
 
 
 def telegram_call(token: str, method: str, payload: dict) -> dict:
@@ -120,11 +131,17 @@ def telegram_call(token: str, method: str, payload: dict) -> dict:
         raise RuntimeError(f"Telegram {method} failed: HTTP {e.code} {body}")
 
 
-def fetch_with_retry(url: str, attempts: int = 3):
+def fetch_with_retry(url: str, attempts: int = 4, extra_headers: dict = None):
     last_err = None
     for i in range(attempts):
         try:
-            return http_get_json(url)
+            return http_get_json(url, extra_headers=extra_headers)
+        except urllib.error.HTTPError as e:
+            last_err = e
+            # 429 = rate limited. Wait longer.
+            wait = 30 if e.code == 429 else (2 ** i)
+            print(f"WARN: HTTP {e.code} on attempt {i+1}; sleeping {wait}s", file=sys.stderr)
+            time.sleep(wait)
         except Exception as e:
             last_err = e
             time.sleep(2 ** i)
@@ -136,7 +153,7 @@ def fetch_with_retry(url: str, attempts: int = 3):
 def fetch_market_data() -> list:
     ids = ",".join(c[0] for c in COINS)
     url = CG_MARKETS_URL.format(ids=urllib.parse.quote(ids, safe=","))
-    data = fetch_with_retry(url)
+    data = fetch_with_retry(url, extra_headers=coingecko_headers())
     if not isinstance(data, list) or not data:
         raise RuntimeError(f"Unexpected markets response: {data}")
     by_id = {c["id"]: c for c in data}
@@ -150,7 +167,7 @@ def fetch_market_data() -> list:
 
 def fetch_global() -> dict:
     try:
-        d = fetch_with_retry(CG_GLOBAL_URL)["data"]
+        d = fetch_with_retry(CG_GLOBAL_URL, extra_headers=coingecko_headers())["data"]
         return {
             "mcap_usd": float(d["total_market_cap"]["usd"]),
             "mcap_change_24h_pct": float(d.get("market_cap_change_percentage_24h_usd", 0.0)),
