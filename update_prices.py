@@ -1,9 +1,15 @@
 """
-AURA DEX Telegram pinned price ticker (v2)
+AURA DEX Telegram pinned price ticker (v3)
 ------------------------------------------
-Fetches BTC / ETH / SOL / TRX / JUP / RAY / ORCA prices, 24h and 7d
-percent changes from CoinGecko and edits a pinned Telegram channel
-message via the Bot API.
+Fetches market data and edits a pinned Telegram channel message.
+
+v3 features:
+    - 8 coins: BTC ETH SOL TRX XAUT JUP RAY ORCA
+    - 24h and 7d percent change with green/red emoji
+    - 7-day sparkline mini-chart per coin (Unicode block chars)
+    - Global market line: total market cap, BTC dominance, Fear & Greed
+    - Top mover / worst performer (24h) callouts
+    - Auto pin + edit; safe re-runs
 
 Required env vars:
     BOT_TOKEN   Telegram bot token from @BotFather
@@ -12,8 +18,7 @@ Required env vars:
 Optional env vars:
     MESSAGE_ID    ID of the message to edit. If missing or 0, the
                   script SENDS + PINS a new message and prints its ID.
-                  Take that ID and put it in MESSAGE_ID for future runs.
-    AURA_DEX_URL  Link shown at the bottom. Default: https://auradex.io
+    AURA_DEX_URL  Link in the footer. Default: https://auradex.io
 """
 
 import os
@@ -24,7 +29,6 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-# CoinGecko IDs in the display order we want.
 # (CoinGecko-id, display-symbol)
 COINS = [
     ("bitcoin",                  "BTC"),
@@ -37,18 +41,26 @@ COINS = [
     ("orca",                     "ORCA"),
 ]
 
-COINGECKO_URL = (
+CG_MARKETS_URL = (
     "https://api.coingecko.com/api/v3/coins/markets"
     "?vs_currency=usd"
     "&ids={ids}"
     "&price_change_percentage=24h,7d"
+    "&sparkline=true"
 )
+CG_GLOBAL_URL = "https://api.coingecko.com/api/v3/global"
+FNG_URL = "https://api.alternative.me/fng/"
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 
+SPARK_CHARS = "▁▂▃▄▅▆▇█"
+SPARK_WIDTH = 10  # chars per coin row
 
-def http_get_json(url: str, timeout: int = 15) -> object:
-    req = urllib.request.Request(url, headers={"User-Agent": "aura-price-bot/2.0"})
+
+# ---------- HTTP ----------
+
+def http_get_json(url: str, timeout: int = 15):
+    req = urllib.request.Request(url, headers={"User-Agent": "aura-price-bot/3.0"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -65,28 +77,63 @@ def telegram_call(token: str, method: str, payload: dict) -> dict:
         raise RuntimeError(f"Telegram {method} failed: HTTP {e.code} {body}")
 
 
-def fetch_market_data() -> list:
-    ids = ",".join(c[0] for c in COINS)
-    url = COINGECKO_URL.format(ids=urllib.parse.quote(ids, safe=","))
+def fetch_with_retry(url: str, attempts: int = 3):
     last_err = None
-    for attempt in range(3):
+    for i in range(attempts):
         try:
-            data = http_get_json(url)
-            if not isinstance(data, list) or not data:
-                raise RuntimeError(f"Unexpected response: {data}")
-            # Build dict by id, then re-sort to our display order
-            by_id = {c["id"]: c for c in data}
-            ordered = []
-            for cg_id, sym in COINS:
-                if cg_id not in by_id:
-                    raise RuntimeError(f"CoinGecko response missing id: {cg_id}")
-                ordered.append((sym, by_id[cg_id]))
-            return ordered
+            return http_get_json(url)
         except Exception as e:
             last_err = e
-            time.sleep(2 ** attempt)
-    raise RuntimeError(f"CoinGecko fetch failed after retries: {last_err}")
+            time.sleep(2 ** i)
+    raise RuntimeError(f"Fetch failed: {url} -> {last_err}")
 
+
+# ---------- Data fetchers ----------
+
+def fetch_market_data() -> list:
+    ids = ",".join(c[0] for c in COINS)
+    url = CG_MARKETS_URL.format(ids=urllib.parse.quote(ids, safe=","))
+    data = fetch_with_retry(url)
+    if not isinstance(data, list) or not data:
+        raise RuntimeError(f"Unexpected markets response: {data}")
+    by_id = {c["id"]: c for c in data}
+    ordered = []
+    for cg_id, sym in COINS:
+        if cg_id not in by_id:
+            raise RuntimeError(f"Markets response missing id: {cg_id}")
+        ordered.append((sym, by_id[cg_id]))
+    return ordered
+
+
+def fetch_global() -> dict:
+    """Returns {'mcap_usd', 'mcap_change_24h_pct', 'btc_dominance'} or None on failure."""
+    try:
+        d = fetch_with_retry(CG_GLOBAL_URL)["data"]
+        return {
+            "mcap_usd": float(d["total_market_cap"]["usd"]),
+            "mcap_change_24h_pct": float(d.get("market_cap_change_percentage_24h_usd", 0.0)),
+            "btc_dominance": float(d["market_cap_percentage"]["btc"]),
+        }
+    except Exception as e:
+        print(f"WARN: global fetch failed: {e}", file=sys.stderr)
+        return None
+
+
+def fetch_fng() -> dict:
+    """Returns {'value', 'classification'} or None on failure."""
+    try:
+        d = fetch_with_retry(FNG_URL)
+        item = d["data"][0]
+        return {
+            "value": int(item["value"]),
+            "classification": item["value_classification"],
+        }
+    except Exception as e:
+        print(f"WARN: F&G fetch failed: {e}", file=sys.stderr)
+        return None
+
+
+# ---------- Formatters ----------
 
 def fmt_price(value) -> str:
     try:
@@ -112,6 +159,16 @@ def fmt_pct(value) -> str:
     return f"{v:+.2f}%"
 
 
+def fmt_mcap(v: float) -> str:
+    if v >= 1e12:
+        return f"${v/1e12:.2f}T"
+    if v >= 1e9:
+        return f"${v/1e9:.2f}B"
+    if v >= 1e6:
+        return f"${v/1e6:.2f}M"
+    return f"${v:,.0f}"
+
+
 def direction_emoji(value) -> str:
     if value is None:
         return "⚪"
@@ -126,32 +183,102 @@ def direction_emoji(value) -> str:
     return "⚪"
 
 
-def build_message(market_data: list, aura_url: str) -> str:
+def fng_emoji(classification: str) -> str:
+    c = (classification or "").lower()
+    if "extreme fear" in c:
+        return "🔴"
+    if "fear" in c:
+        return "🟠"
+    if "neutral" in c:
+        return "🟡"
+    if "extreme greed" in c:
+        return "🟢"
+    if "greed" in c:
+        return "🟢"
+    return "⚪"
+
+
+def make_sparkline(prices, width: int = SPARK_WIDTH) -> str:
+    if not prices or len(prices) < 2:
+        return " " * width
+    if width <= 1:
+        return SPARK_CHARS[3]
+    step = (len(prices) - 1) / (width - 1)
+    sampled = [prices[round(i * step)] for i in range(width)]
+    lo = min(sampled)
+    hi = max(sampled)
+    if hi - lo < 1e-9:
+        return SPARK_CHARS[3] * width
+    n = len(SPARK_CHARS) - 1
+    return "".join(
+        SPARK_CHARS[round((p - lo) / (hi - lo) * n)]
+        for p in sampled
+    )
+
+
+# ---------- Message builder ----------
+
+def build_message(market_data: list, global_data, fng_data, aura_url: str) -> str:
     ts = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
-    # Monospace table inside <pre> for clean column alignment.
+    # Top header line: market cap + BTC.D + sentiment
+    header_bits = []
+    if global_data:
+        header_bits.append(
+            f"Market {fmt_mcap(global_data['mcap_usd'])} "
+            f"({global_data['mcap_change_24h_pct']:+.2f}%)"
+        )
+        header_bits.append(f"BTC.D {global_data['btc_dominance']:.1f}%")
+    if fng_data:
+        header_bits.append(
+            f"Sentiment {fng_data['value']} "
+            f"{fng_data['classification']} {fng_emoji(fng_data['classification'])}"
+        )
+    header_line = " · ".join(header_bits)
+
+    # Coin table rows with sparklines
     rows = []
     for sym, c in market_data:
         emoji = direction_emoji(c.get("price_change_percentage_24h"))
         price = fmt_price(c.get("current_price"))
         pct24 = fmt_pct(c.get("price_change_percentage_24h"))
         pct7d = fmt_pct(c.get("price_change_percentage_7d_in_currency"))
-        # Pad symbol to 5 chars, price to 11, percentages to 8 each
-        rows.append(f"{emoji} {sym:<5} {price:<11} 24h {pct24:>8}   7d {pct7d:>8}")
-
+        sp = make_sparkline(c.get("sparkline_in_7d", {}).get("price", []))
+        # symbol pad 5, price pad 11, sparkline 10
+        rows.append(f"{emoji} {sym:<5} {price:<11} {sp}  {pct24:>8} / {pct7d:>8}")
     table = "\n".join(rows)
 
-    return (
-        "<b>Live Crypto Prices</b>\n"
-        "\n"
-        f"<pre>{table}</pre>\n"
-        "<i>🟢 = 24h up · 🔴 = 24h down</i>\n"
-        "\n"
-        f"<i>Updated: {ts} · auto-refresh 15 min</i>\n"
-        "\n"
-        f'Trade on <a href="{aura_url}">AURA DEX</a>'
+    # Top mover / worst performer (24h)
+    movers = [
+        (sym, c.get("price_change_percentage_24h") or 0.0)
+        for sym, c in market_data
+    ]
+    movers_sorted = sorted(movers, key=lambda x: x[1])
+    worst_sym, worst_pct = movers_sorted[0]
+    best_sym, best_pct = movers_sorted[-1]
+
+    movers_lines = (
+        f"🚀 Best 24h: <b>{best_sym}</b> {best_pct:+.2f}%\n"
+        f"💀 Worst 24h: <b>{worst_sym}</b> {worst_pct:+.2f}%"
     )
 
+    parts = ["<b>Live Crypto Prices</b>", ""]
+    if header_line:
+        parts.append(f"<i>{header_line}</i>")
+        parts.append("")
+    parts.append(f"<pre>{table}</pre>")
+    parts.append("")
+    parts.append(movers_lines)
+    parts.append("")
+    parts.append("<i>Format: 24h % / 7d % · 🟢 up · 🔴 down · ▁▂▃▄▅▆▇█ = 7d trend</i>")
+    parts.append(f"<i>Updated: {ts} · auto-refresh 15 min</i>")
+    parts.append("")
+    parts.append(f'Trade on <a href="{aura_url}">AURA DEX</a>')
+
+    return "\n".join(parts)
+
+
+# ---------- Telegram I/O ----------
 
 def send_and_pin(token: str, chat_id: str, text: str) -> int:
     print("MESSAGE_ID not set -> sending a new message and pinning it.")
@@ -200,6 +327,8 @@ def edit_message(token: str, chat_id: str, message_id: int, text: str) -> None:
     print(f"Edited message {message_id}.")
 
 
+# ---------- main ----------
+
 def main() -> int:
     token = os.environ.get("BOT_TOKEN", "").strip()
     chat_id = os.environ.get("CHAT_ID", "").strip()
@@ -214,7 +343,10 @@ def main() -> int:
         return 2
 
     market_data = fetch_market_data()
-    text = build_message(market_data, aura_url)
+    global_data = fetch_global()
+    fng_data = fetch_fng()
+
+    text = build_message(market_data, global_data, fng_data, aura_url)
     print("Built message:\n" + text + "\n")
 
     try:
