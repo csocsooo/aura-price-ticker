@@ -26,4 +26,5 @@ jobs:
           CHAT_ID_RO: ${{ secrets.CHAT_ID_RO }}
           MESSAGE_ID_RO: ${{ secrets.MESSAGE_ID_RO }}
           AURA_DEX_URL: ${{ secrets.AURA_DEX_URL }}
+          COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
         run: python update_prices.py
