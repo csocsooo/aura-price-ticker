@@ -145,6 +145,7 @@ def build_message(market_data: list, aura_url: str) -> str:
         "<b>Live Crypto Prices</b>\n"
         "\n"
         f"<pre>{table}</pre>\n"
+        "<i>🟢 = 24h up · 🔴 = 24h down</i>\n"
         "\n"
         f"<i>Updated: {ts} · auto-refresh 15 min</i>\n"
         "\n"
