@@ -23,5 +23,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           MESSAGE_ID: ${{ secrets.MESSAGE_ID }}
+          CHAT_ID_RO: ${{ secrets.CHAT_ID_RO }}
+          MESSAGE_ID_RO: ${{ secrets.MESSAGE_ID_RO }}
           AURA_DEX_URL: ${{ secrets.AURA_DEX_URL }}
         run: python update_prices.py
