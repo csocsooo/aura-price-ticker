@@ -128,7 +128,13 @@ def telegram_call(token: str, method: str, payload: dict) -> dict:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Telegram {method} failed: HTTP {e.code} {body}")
+        # Telegram returns errors as HTTP 4xx with a JSON envelope
+        # (ok=false, description); return it so callers can inspect the
+        # description (e.g. "message is not modified" is a benign no-op).
+        try:
+            return json.loads(body)
+        except ValueError:
+            raise RuntimeError(f"Telegram {method} failed: HTTP {e.code} {body}")
 
 
 def fetch_with_retry(url: str, attempts: int = 4, extra_headers: dict = None):
