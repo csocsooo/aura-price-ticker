@@ -100,6 +100,16 @@ FNG_TRANS = {
 }
 
 
+# ---------- Errors ----------
+
+class TransientError(Exception):
+    """A self-healing failure (network blip, rate limit, upstream 5xx, or a
+    temporary bad response). The next scheduled run 15 minutes later re-posts
+    the same pinned message, so a TransientError must NOT fail the workflow —
+    otherwise GitHub emails the owner about noise that already fixed itself.
+    Reserve a non-zero exit (and thus an email) for permanent/config errors."""
+
+
 # ---------- HTTP ----------
 
 def http_get_json(url: str, timeout: int = 15, extra_headers: dict = None):
@@ -119,22 +129,58 @@ def coingecko_headers() -> dict:
     return {}
 
 
-def telegram_call(token: str, method: str, payload: dict) -> dict:
+def _retry_after(body: str, default: int = 5) -> int:
+    """Telegram 429 responses carry {"parameters": {"retry_after": N}}."""
+    try:
+        n = int(json.loads(body).get("parameters", {}).get("retry_after", default))
+        return max(1, min(n, 60))  # clamp so we never blow the 5-min job budget
+    except Exception:
+        return default
+
+
+def telegram_call(token: str, method: str, payload: dict, attempts: int = 4) -> dict:
+    """Call the Telegram Bot API with retry on transient failures.
+
+    Retries network errors, HTTP 429 (rate limit, honouring retry_after) and
+    HTTP 5xx (Telegram-side hiccups) with backoff. Genuine application errors
+    (other 4xx: "message is not modified", "chat not found", ...) are returned
+    to the caller as the JSON envelope (ok=false) exactly as before, so their
+    permanent-vs-benign handling is unchanged. If the transient retries are
+    exhausted, raises TransientError so the run self-heals without emailing."""
     url = TELEGRAM_API.format(token=token, method=method)
     data = urllib.parse.urlencode(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data)
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        # Telegram returns errors as HTTP 4xx with a JSON envelope
-        # (ok=false, description); return it so callers can inspect the
-        # description (e.g. "message is not modified" is a benign no-op).
+    last_err = None
+    for i in range(attempts):
         try:
-            return json.loads(body)
-        except ValueError:
-            raise RuntimeError(f"Telegram {method} failed: HTTP {e.code} {body}")
+            req = urllib.request.Request(url, data=data)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            if e.code == 429 or e.code >= 500:
+                # Transient: rate limited or upstream error. Back off + retry.
+                last_err = f"HTTP {e.code} {body[:200]}"
+                wait = _retry_after(body) if e.code == 429 else (2 ** i)
+                print(f"WARN: Telegram {method} HTTP {e.code} on attempt "
+                      f"{i+1}/{attempts}; sleeping {wait}s", file=sys.stderr)
+                time.sleep(wait)
+                continue
+            # Other 4xx = application error with a JSON envelope
+            # (ok=false, description). Return it so callers can inspect the
+            # description ("message is not modified" is a benign no-op; things
+            # like "chat not found" are permanent and should surface).
+            try:
+                return json.loads(body)
+            except ValueError:
+                raise RuntimeError(f"Telegram {method} failed: HTTP {e.code} {body}")
+        except urllib.error.URLError as e:
+            # Network-level blip (timeout, DNS, connection reset). Transient.
+            last_err = str(e)
+            print(f"WARN: Telegram {method} network error on attempt "
+                  f"{i+1}/{attempts}: {e}; retrying", file=sys.stderr)
+            time.sleep(2 ** i)
+    raise TransientError(
+        f"Telegram {method} failed after {attempts} attempts: {last_err}")
 
 
 def fetch_with_retry(url: str, attempts: int = 4, extra_headers: dict = None):
@@ -151,7 +197,7 @@ def fetch_with_retry(url: str, attempts: int = 4, extra_headers: dict = None):
         except Exception as e:
             last_err = e
             time.sleep(2 ** i)
-    raise RuntimeError(f"Fetch failed: {url} -> {last_err}")
+    raise TransientError(f"Fetch failed after {attempts} attempts: {url} -> {last_err}")
 
 
 # ---------- Data fetchers ----------
@@ -433,11 +479,22 @@ def main() -> int:
         print("ERROR: No channels configured. Set CHAT_ID and/or CHAT_ID_RO.", file=sys.stderr)
         return 2
 
-    market_data = fetch_market_data()
-    global_data = fetch_global()
-    fng_data = fetch_fng()
+    # Market data is required to build the message. If it can't be fetched
+    # (rate limit, upstream outage, malformed payload) there is nothing to
+    # post — skip this run and let the next 15-min cron retry. Exit 0 so no
+    # failure email is sent for a blip that fixes itself.
+    try:
+        market_data = fetch_market_data()
+    except Exception as e:
+        print(f"::warning::Market data unavailable, skipping this run "
+              f"(self-heals next cron): {e}", file=sys.stderr)
+        return 0
 
-    failures = 0
+    global_data = fetch_global()   # soft-fails to None
+    fng_data = fetch_fng()         # soft-fails to None
+
+    transient_failures = 0
+    permanent_failures = 0
     for ch in channels:
         try:
             text = build_message(market_data, global_data, fng_data, aura_url, lang=ch["lang"])
@@ -446,11 +503,24 @@ def main() -> int:
                 send_and_pin(token, ch["chat_id"], text, label=f"{ch['label']}_")
             else:
                 edit_message(token, ch["chat_id"], ch["message_id"], text, label=ch["label"])
+        except TransientError as e:
+            # Network/rate-limit/5xx after retries. Self-heals next run.
+            print(f"::warning::[{ch['label']}] transient error, next cron will "
+                  f"retry: {e}", file=sys.stderr)
+            transient_failures += 1
         except Exception as e:
-            print(f"[{ch['label']}] ERROR: {e}", file=sys.stderr)
-            failures += 1
+            # Permanent/config error (bad token, chat not found, message
+            # deleted, no edit rights, ...). This will NOT fix itself, so
+            # surface it: non-zero exit -> the owner gets a failure email.
+            print(f"::error::[{ch['label']}] permanent error: {e}", file=sys.stderr)
+            permanent_failures += 1
 
-    return 1 if failures else 0
+    if transient_failures and not permanent_failures:
+        print("::warning::One or more channels failed transiently; the next "
+              "scheduled run will retry. Not failing the workflow.", file=sys.stderr)
+
+    # Only genuine, non-self-healing problems fail the workflow (and email).
+    return 1 if permanent_failures else 0
 
 
 if __name__ == "__main__":
