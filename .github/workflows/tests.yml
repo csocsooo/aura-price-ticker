@@ -19,6 +19,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Standard library only, so there is nothing to install.
+      # Standard library only, so there is nothing to install. Not plain
+      # `unittest discover`: that exits 0 when it finds no tests at all, and
+      # a green run that tested nothing is not a pass.
       - name: Run unit tests
-        run: python -m unittest discover -v -p "test_*.py"
+        run: python run_tests.py

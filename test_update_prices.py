@@ -271,5 +271,40 @@ class MainExitCodeTest(unittest.TestCase):
                          "a green run must not create a cache entry")
 
 
+class RunnerGuardTest(unittest.TestCase):
+    """run_tests.py must not report success on a run that tested nothing."""
+
+    @staticmethod
+    def _run_guard(suite):
+        import run_tests
+        patches = [
+            mock.patch.object(unittest.TestLoader, "discover",
+                              lambda self, *a, **kw: suite),
+            mock.patch.object(sys, "stderr", io.StringIO()),
+            mock.patch.object(sys, "stdout", io.StringIO()),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            return run_tests.main()
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_empty_discovery_fails(self):
+        self.assertEqual(self._run_guard(unittest.TestSuite()), 1,
+                         "zero discovered tests must not pass CI")
+
+    def test_non_empty_discovery_passes(self):
+        """Positive control: the guard must not simply always fail."""
+
+        class Trivial(unittest.TestCase):
+            def test_ok(self):
+                pass
+
+        suite = unittest.TestLoader().loadTestsFromTestCase(Trivial)
+        self.assertEqual(self._run_guard(suite), 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
