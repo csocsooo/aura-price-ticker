@@ -5,6 +5,13 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
+# The silence counter below is shared mutable state, so two runs must not
+# overlap. Queue rather than cancel the running one: a cancelled run would
+# look like another silent run to the watchdog.
+concurrency:
+  group: aura-price-ticker
+  cancel-in-progress: false
+
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -18,7 +25,21 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Carries "how many runs in a row failed to update the pinned message"
+      # from the previous run. The primary key never hits on purpose, the
+      # prefix in restore-keys resolves to the most recently saved counter.
+      # A cache miss means healthy, so a cache outage must never fail the job.
+      - name: Restore ticker health counter
+        continue-on-error: true
+        uses: actions/cache/restore@v5
+        with:
+          path: .ticker-health
+          key: ticker-health-${{ github.run_id }}
+          restore-keys: |
+            ticker-health-
+
       - name: Run updater
+        id: updater
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
@@ -28,3 +49,15 @@ jobs:
           AURA_DEX_URL: ${{ secrets.AURA_DEX_URL }}
           COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
         run: python update_prices.py
+
+      # Only when the counter actually moved. A green run every 15 minutes
+      # would otherwise leave roughly 96 cache entries a day behind.
+      # always(), because the escalating run exits 1 and its reset still has
+      # to be persisted, or it would escalate again on the very next run.
+      - name: Save ticker health counter
+        if: always() && steps.updater.outputs.health_changed == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: .ticker-health
+          key: ticker-health-${{ github.run_id }}

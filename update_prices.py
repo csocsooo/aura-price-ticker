@@ -51,6 +51,18 @@ FNG_URL = "https://api.alternative.me/fng/"
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}/{method}"
 
+# ---------- Watchdog ----------
+#
+# A transient failure exits 0, so a 15-minute blip does not email the owner.
+# The price of that quiet is silence: if Telegram or CoinGecko stays down,
+# every run would keep exiting 0 and nobody would ever learn that the pinned
+# message had stopped moving. So count the runs in a row that failed to
+# update it, and once the ticker has been silent for MAX_SILENT_RUNS, fail
+# loudly. The counter lives in a file the workflow round-trips through the
+# Actions cache; a missing or unreadable file just means "healthy".
+HEALTH_FILE = ".ticker-health"
+MAX_SILENT_RUNS = 4   # 4 consecutive misses = one hour on the 15-min cron
+
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
 SPARK_WIDTH = 10
 
@@ -466,6 +478,58 @@ def parse_int(s: str) -> int:
         return 0
 
 
+def read_silent_runs() -> int:
+    """How many runs in a row have failed to update the pinned message."""
+    try:
+        with open(HEALTH_FILE, "r", encoding="utf-8") as fh:
+            return max(0, int(fh.read().strip() or 0))
+    except (OSError, ValueError):
+        # No cache entry yet, or a corrupted one. Assume healthy: a broken
+        # watchdog must never be the reason a run fails.
+        return 0
+
+
+def write_silent_runs(n: int) -> None:
+    """Persist the counter and tell the workflow the cache is worth saving.
+
+    The workflow only re-saves when health_changed is set, otherwise a green
+    run every 15 minutes would leave ~96 cache entries a day behind."""
+    try:
+        with open(HEALTH_FILE, "w", encoding="utf-8") as fh:
+            fh.write(str(n))
+    except OSError as e:
+        print(f"WARN: could not write {HEALTH_FILE}: {e}", file=sys.stderr)
+        return
+    out = os.environ.get("GITHUB_OUTPUT")
+    if not out:
+        return   # running locally, not under Actions
+    try:
+        with open(out, "a", encoding="utf-8") as fh:
+            print("health_changed=true", file=fh)
+    except OSError as e:
+        print(f"WARN: could not write GITHUB_OUTPUT: {e}", file=sys.stderr)
+
+
+def record_silent_run(previous: int, reason: str) -> int:
+    """The pinned message did not get updated this run. Returns the exit code.
+
+    0 while the outage is still plausibly a blip, 1 once it has lasted
+    MAX_SILENT_RUNS in a row, which is the point where staying quiet is worse
+    than an email. The counter resets on escalation, so a long outage emails
+    roughly once an hour instead of every 15 minutes."""
+    n = previous + 1
+    if n < MAX_SILENT_RUNS:
+        print(f"::warning::Ticker silent {n}/{MAX_SILENT_RUNS} runs in a row "
+              f"({reason}). Not failing the workflow yet.", file=sys.stderr)
+        write_silent_runs(n)
+        return 0
+    print(f"::error::Ticker has not updated for {n} runs in a row, about "
+          f"{n * 15} minutes. This is no longer a blip. Last reason: {reason}",
+          file=sys.stderr)
+    write_silent_runs(0)
+    return 1
+
+
 def main() -> int:
     token = os.environ.get("BOT_TOKEN", "").strip()
     aura_url = os.environ.get("AURA_DEX_URL", "https://auradex.io").strip()
@@ -497,16 +561,19 @@ def main() -> int:
         print("ERROR: No channels configured. Set CHAT_ID and/or CHAT_ID_RO.", file=sys.stderr)
         return 2
 
+    silent_runs = read_silent_runs()
+
     # Market data is required to build the message. If it can't be fetched
     # (rate limit, upstream outage, malformed payload) there is nothing to
     # post — skip this run and let the next 15-min cron retry. Exit 0 so no
-    # failure email is sent for a blip that fixes itself.
+    # failure email is sent for a blip that fixes itself, but the watchdog
+    # still counts it: no market data means the ticker went stale too.
     try:
         market_data = fetch_market_data()
     except Exception as e:
         print(f"::warning::Market data unavailable, skipping this run "
               f"(self-heals next cron): {e}", file=sys.stderr)
-        return 0
+        return record_silent_run(silent_runs, f"market data unavailable: {e}")
 
     global_data = fetch_global()   # soft-fails to None
     fng_data = fetch_fng()         # soft-fails to None
@@ -533,12 +600,25 @@ def main() -> int:
             print(f"::error::[{ch['label']}] permanent error: {e}", file=sys.stderr)
             permanent_failures += 1
 
-    if transient_failures and not permanent_failures:
+    # A permanent error already emails on its own, so the watchdog has
+    # nothing to add and its counter goes back to zero.
+    if permanent_failures:
+        if silent_runs:
+            write_silent_runs(0)
+        return 1
+
+    if transient_failures:
         print("::warning::One or more channels failed transiently; the next "
               "scheduled run will retry. Not failing the workflow.", file=sys.stderr)
+        return record_silent_run(
+            silent_runs,
+            f"{transient_failures} of {len(channels)} channel(s) failed transiently")
 
-    # Only genuine, non-self-healing problems fail the workflow (and email).
-    return 1 if permanent_failures else 0
+    # Every channel is current again.
+    if silent_runs:
+        print(f"Ticker recovered after {silent_runs} silent run(s).")
+        write_silent_runs(0)
+    return 0
 
 
 if __name__ == "__main__":
