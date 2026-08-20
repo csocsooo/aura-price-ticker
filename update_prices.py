@@ -23,6 +23,7 @@ import os
 import sys
 import time
 import json
+import http.client
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -156,14 +157,21 @@ def telegram_call(token: str, method: str, payload: dict, attempts: int = 4) -> 
             with urllib.request.urlopen(req, timeout=15) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                # Reading the error body can itself time out. Losing the body
+                # must not turn a classified HTTP error into an unclassified
+                # crash, so fall back to an empty body.
+                body = ""
             if e.code == 429 or e.code >= 500:
                 # Transient: rate limited or upstream error. Back off + retry.
                 last_err = f"HTTP {e.code} {body[:200]}"
                 wait = _retry_after(body) if e.code == 429 else (2 ** i)
                 print(f"WARN: Telegram {method} HTTP {e.code} on attempt "
                       f"{i+1}/{attempts}; sleeping {wait}s", file=sys.stderr)
-                time.sleep(wait)
+                if i < attempts - 1:
+                    time.sleep(wait)
                 continue
             # Other 4xx = application error with a JSON envelope
             # (ok=false, description). Return it so callers can inspect the
@@ -173,12 +181,22 @@ def telegram_call(token: str, method: str, payload: dict, attempts: int = 4) -> 
                 return json.loads(body)
             except ValueError:
                 raise RuntimeError(f"Telegram {method} failed: HTTP {e.code} {body}")
-        except urllib.error.URLError as e:
-            # Network-level blip (timeout, DNS, connection reset). Transient.
-            last_err = str(e)
+        except (OSError, http.client.HTTPException, ValueError) as e:
+            # Transport-level blip: connect/DNS failure (URLError), read
+            # timeout, connection reset, TLS hiccup, or a truncated body that
+            # will not parse as JSON. All self-heal on the next 15-min cron.
+            #
+            # Catching urllib.error.URLError alone was NOT enough: a timeout
+            # while reading the response body raises a bare TimeoutError
+            # ("The read operation timed out"), which is an OSError but not a
+            # URLError, so it escaped this handler, skipped the retries, and
+            # was counted as a permanent error in main() -> exit 1 -> failure
+            # email. That is exactly what happened on run 11463 (2026-08-19).
+            last_err = f"{type(e).__name__}: {e}"
             print(f"WARN: Telegram {method} network error on attempt "
-                  f"{i+1}/{attempts}: {e}; retrying", file=sys.stderr)
-            time.sleep(2 ** i)
+                  f"{i+1}/{attempts}: {last_err}; retrying", file=sys.stderr)
+            if i < attempts - 1:
+                time.sleep(2 ** i)
     raise TransientError(
         f"Telegram {method} failed after {attempts} attempts: {last_err}")
 
