@@ -12,6 +12,10 @@ concurrency:
   group: aura-price-ticker
   cancel-in-progress: false
 
+# Least privilege by default, the keepalive job widens it for itself.
+permissions:
+  contents: read
+
 jobs:
   update:
     runs-on: ubuntu-latest
