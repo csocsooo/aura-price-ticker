@@ -16,6 +16,9 @@ jobs:
   update:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -61,3 +64,14 @@ jobs:
         with:
           path: .ticker-health
           key: ticker-health-${{ github.run_id }}
+
+      # GitHub disables scheduled workflows after 60 days without a commit,
+      # which silently froze the ticker on 2026-10-19. Calling the enable
+      # endpoint resets that timer. It is idempotent and cheap, so every run
+      # calls it rather than betting on one run landing in a time window.
+      - name: Keep the schedule alive
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/update-prices.yml/enable"
